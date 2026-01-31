@@ -211,10 +211,15 @@ def calculate_per_core_usage(prev_cores, curr_cores):
         iowait_delta = curr['iowait'] - prev['iowait']
         used_delta = total_delta - idle_delta - iowait_delta
 
+        user_delta = curr['user'] - prev['user'] + curr['nice'] - prev['nice']
+        system_delta = curr['system'] - prev['system'] + curr['irq'] - prev['irq'] + curr['softirq'] - prev['softirq']
+
         result.append({
             'core': curr['core'],
-            'usage': (used_delta / total_delta) * 100,
-            'iowait': (iowait_delta / total_delta) * 100
+            'user': (user_delta / total_delta) * 100,
+            'system': (system_delta / total_delta) * 100,
+            'iowait': (iowait_delta / total_delta) * 100,
+            'idle': (idle_delta / total_delta) * 100
         })
 
     return result
@@ -628,11 +633,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             border-radius: 6px;
             transition: width 0.5s ease;
         }
-        .cpu-bar-used {
-            background: linear-gradient(90deg, #4CAF50 0%, #8BC34A 100%);
+        .cpu-bar-user {
+            background: #4CAF50;
+        }
+        .cpu-bar-system {
+            background: #2196F3;
         }
         .cpu-bar-iowait {
-            background: linear-gradient(90deg, #FF9800 0%, #FFC107 100%);
+            background: #FF9800;
         }
         .cpu-bar-value {
             width: 45px;
@@ -740,11 +748,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-value" id="uptime">-</div>
                 <div class="card-sub">node uptime</div>
             </div>
-            <div class="card">
-                <div class="card-title">Load Average</div>
-                <div class="card-value" id="loadAvg">-</div>
-                <div class="card-sub" id="loadDetails">1m / 5m / 15m</div>
-            </div>
         </div>
 
         <div class="footer">
@@ -774,18 +777,21 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
             for (var i = 0; i < perCore.length; i++) {
                 var core = perCore[i];
-                var usage = core.usage || 0;
+                var user = core.user || 0;
+                var system = core.system || 0;
                 var iowait = core.iowait || 0;
+                var total = user + system + iowait;
 
                 html += '<div class="cpu-bar-container">';
                 html += '<span class="cpu-bar-label">Core ' + core.core + '</span>';
-                html += '<div class="cpu-bar-bg">';
-                html += '<div class="cpu-bar cpu-bar-used" style="width: ' + usage.toFixed(1) + '%; display: inline-block;"></div>';
-                if (iowait > 0.5) {
-                    html += '<div class="cpu-bar cpu-bar-iowait" style="width: ' + iowait.toFixed(1) + '%; display: inline-block;"></div>';
+                html += '<div class="cpu-bar-bg" style="display: flex;">';
+                html += '<div class="cpu-bar cpu-bar-user" style="width: ' + user.toFixed(1) + '%;"></div>';
+                html += '<div class="cpu-bar cpu-bar-system" style="width: ' + system.toFixed(1) + '%;"></div>';
+                if (iowait > 0.1) {
+                    html += '<div class="cpu-bar cpu-bar-iowait" style="width: ' + iowait.toFixed(1) + '%;"></div>';
                 }
                 html += '</div>';
-                html += '<span class="cpu-bar-value">' + usage.toFixed(0) + '%</span>';
+                html += '<span class="cpu-bar-value">' + total.toFixed(0) + '%</span>';
                 html += '</div>';
             }
 
@@ -850,15 +856,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     // Per-core CPU bars
                     if (data.cpu_per_core) {
                         renderCpuBars(data.cpu_per_core);
-                    }
-
-                    // Load average
-                    if (data.load_1m !== undefined) {
-                        document.getElementById('loadAvg').textContent = data.load_1m.toFixed(2);
-                        document.getElementById('loadDetails').textContent =
-                            data.load_1m.toFixed(2) + ' / ' +
-                            (data.load_5m || 0).toFixed(2) + ' / ' +
-                            (data.load_15m || 0).toFixed(2);
                     }
 
                     // Memory
