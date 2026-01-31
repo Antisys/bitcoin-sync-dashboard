@@ -635,12 +635,15 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         .cpu-bar-user {
             background: #4CAF50;
+            height: 12px;
         }
         .cpu-bar-system {
             background: #2196F3;
+            height: 12px;
         }
         .cpu-bar-iowait {
             background: #FF9800;
+            height: 12px;
         }
         .cpu-bar-value {
             width: 45px;
@@ -973,8 +976,11 @@ def main():
     print(f"Dashboard: http://0.0.0.0:{CONFIG['port']}")
     print()
 
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("0.0.0.0", CONFIG['port']), DashboardHandler) as httpd:
+    class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    with ThreadedTCPServer(("0.0.0.0", CONFIG['port']), DashboardHandler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
