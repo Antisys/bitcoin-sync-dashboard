@@ -56,6 +56,13 @@ CONFIG = {
 # Store historical data for speed calculation
 history = deque(maxlen=60)
 
+# Store previous CPU stats for delta calculation
+prev_cpu_stats = {
+    'timestamp': 0,
+    'total': None,
+    'per_core': None
+}
+
 
 def run_command(cmd, timeout=15):
     """Run a command locally or via SSH depending on config"""
@@ -95,6 +102,161 @@ def run_bitcoin_cli(rpc_cmd):
     return run_command(cmd)
 
 
+def parse_proc_stat(stat_output):
+    """
+    Parse /proc/stat output and return CPU times.
+
+    Format: cpu user nice system idle iowait irq softirq steal guest guest_nice
+    Returns dict with: user, nice, system, idle, iowait, irq, softirq, total
+    """
+    result = {'total': None, 'per_core': []}
+
+    if not stat_output:
+        return result
+
+    for line in stat_output.split('\n'):
+        parts = line.split()
+        if not parts:
+            continue
+
+        if parts[0] == 'cpu':
+            # Total CPU line
+            try:
+                times = [int(x) for x in parts[1:8]]  # user, nice, system, idle, iowait, irq, softirq
+                result['total'] = {
+                    'user': times[0],
+                    'nice': times[1],
+                    'system': times[2],
+                    'idle': times[3],
+                    'iowait': times[4],
+                    'irq': times[5],
+                    'softirq': times[6],
+                    'total': sum(times)
+                }
+            except (ValueError, IndexError):
+                pass
+
+        elif parts[0].startswith('cpu') and parts[0][3:].isdigit():
+            # Per-core CPU line (cpu0, cpu1, etc.)
+            try:
+                core_num = int(parts[0][3:])
+                times = [int(x) for x in parts[1:8]]
+                result['per_core'].append({
+                    'core': core_num,
+                    'user': times[0],
+                    'nice': times[1],
+                    'system': times[2],
+                    'idle': times[3],
+                    'iowait': times[4],
+                    'irq': times[5],
+                    'softirq': times[6],
+                    'total': sum(times)
+                })
+            except (ValueError, IndexError):
+                pass
+
+    # Sort per-core by core number
+    result['per_core'].sort(key=lambda x: x['core'])
+    return result
+
+
+def calculate_cpu_usage(prev, curr):
+    """
+    Calculate CPU usage percentages from two /proc/stat samples.
+    Returns dict with usage percentages.
+    """
+    if not prev or not curr:
+        return None
+
+    total_delta = curr['total'] - prev['total']
+    if total_delta <= 0:
+        return None
+
+    user_delta = curr['user'] - prev['user']
+    nice_delta = curr['nice'] - prev['nice']
+    system_delta = curr['system'] - prev['system']
+    idle_delta = curr['idle'] - prev['idle']
+    iowait_delta = curr['iowait'] - prev['iowait']
+    irq_delta = curr['irq'] - prev['irq']
+    softirq_delta = curr['softirq'] - prev['softirq']
+
+    return {
+        'user': (user_delta / total_delta) * 100,
+        'nice': (nice_delta / total_delta) * 100,
+        'system': (system_delta / total_delta) * 100,
+        'idle': (idle_delta / total_delta) * 100,
+        'iowait': (iowait_delta / total_delta) * 100,
+        'irq': (irq_delta / total_delta) * 100,
+        'softirq': (softirq_delta / total_delta) * 100,
+        'total_used': ((total_delta - idle_delta - iowait_delta) / total_delta) * 100
+    }
+
+
+def calculate_per_core_usage(prev_cores, curr_cores):
+    """Calculate per-core CPU usage from two samples."""
+    if not prev_cores or not curr_cores:
+        return None
+
+    if len(prev_cores) != len(curr_cores):
+        return None
+
+    result = []
+    for prev, curr in zip(prev_cores, curr_cores):
+        total_delta = curr['total'] - prev['total']
+        if total_delta <= 0:
+            result.append({'core': curr['core'], 'usage': 0, 'iowait': 0})
+            continue
+
+        idle_delta = curr['idle'] - prev['idle']
+        iowait_delta = curr['iowait'] - prev['iowait']
+        used_delta = total_delta - idle_delta - iowait_delta
+
+        result.append({
+            'core': curr['core'],
+            'usage': (used_delta / total_delta) * 100,
+            'iowait': (iowait_delta / total_delta) * 100
+        })
+
+    return result
+
+
+def get_cpu_stats():
+    """Get real CPU utilization by comparing /proc/stat samples."""
+    global prev_cpu_stats
+
+    stats = {}
+
+    # Get current /proc/stat
+    stat_output = run_command("cat /proc/stat")
+    current_time = time.time()
+    current_stats = parse_proc_stat(stat_output)
+
+    # Calculate usage if we have a previous sample (at least 1 second ago)
+    if prev_cpu_stats['total'] and (current_time - prev_cpu_stats['timestamp']) >= 1:
+        # Total CPU usage
+        cpu_usage = calculate_cpu_usage(prev_cpu_stats['total'], current_stats['total'])
+        if cpu_usage:
+            stats['cpu_total_used'] = cpu_usage['total_used']
+            stats['cpu_user'] = cpu_usage['user']
+            stats['cpu_system'] = cpu_usage['system']
+            stats['cpu_iowait'] = cpu_usage['iowait']
+            stats['cpu_idle'] = cpu_usage['idle']
+
+        # Per-core usage
+        per_core = calculate_per_core_usage(prev_cpu_stats['per_core'], current_stats['per_core'])
+        if per_core:
+            stats['cpu_per_core'] = per_core
+
+    # Store current as previous for next call
+    prev_cpu_stats = {
+        'timestamp': current_time,
+        'total': current_stats['total'],
+        'per_core': current_stats['per_core']
+    }
+
+    return stats
+
+
 def get_system_stats():
     """Fetch system stats from the node"""
     stats = {}
@@ -112,7 +274,11 @@ def get_system_stats():
         except ValueError:
             pass
 
-    # Get load average
+    # Get real CPU utilization
+    cpu_stats = get_cpu_stats()
+    stats.update(cpu_stats)
+
+    # Get load average (still useful as a secondary metric)
     load_info = run_command("cat /proc/loadavg")
     if load_info:
         parts = load_info.split()
@@ -434,6 +600,67 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             .card-value { font-size: 1.5em; }
             .progress-text { font-size: 1em; }
         }
+
+        /* CPU bars */
+        .cpu-bars {
+            margin-top: 15px;
+        }
+        .cpu-bar-container {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 0.85em;
+        }
+        .cpu-bar-label {
+            width: 50px;
+            color: #888;
+        }
+        .cpu-bar-bg {
+            flex: 1;
+            height: 12px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 6px;
+            overflow: hidden;
+            margin-right: 10px;
+        }
+        .cpu-bar {
+            height: 100%;
+            border-radius: 6px;
+            transition: width 0.5s ease;
+        }
+        .cpu-bar-used {
+            background: linear-gradient(90deg, #4CAF50 0%, #8BC34A 100%);
+        }
+        .cpu-bar-iowait {
+            background: linear-gradient(90deg, #FF9800 0%, #FFC107 100%);
+        }
+        .cpu-bar-value {
+            width: 45px;
+            text-align: right;
+            color: #aaa;
+        }
+        .cpu-breakdown {
+            display: flex;
+            gap: 15px;
+            margin-top: 10px;
+            font-size: 0.8em;
+            color: #888;
+            flex-wrap: wrap;
+        }
+        .cpu-breakdown span {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .cpu-breakdown .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .dot-user { background: #4CAF50; }
+        .dot-system { background: #2196F3; }
+        .dot-iowait { background: #FF9800; }
+        .dot-idle { background: #666; }
     </style>
 </head>
 <body>
@@ -489,10 +716,19 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
         <h2>System Resources</h2>
         <div class="grid">
-            <div class="card">
-                <div class="card-title">CPU</div>
-                <div class="card-value" id="cpuLoad">-</div>
+            <div class="card" style="grid-column: span 2;">
+                <div class="card-title">CPU Utilization</div>
+                <div class="card-value" id="cpuTotal">-</div>
                 <div class="card-sub" id="cpuModel">-</div>
+                <div class="cpu-breakdown">
+                    <span><span class="dot dot-user"></span> User: <span id="cpuUser">-</span></span>
+                    <span><span class="dot dot-system"></span> System: <span id="cpuSystem">-</span></span>
+                    <span><span class="dot dot-iowait"></span> I/O Wait: <span id="cpuIowait">-</span></span>
+                    <span><span class="dot dot-idle"></span> Idle: <span id="cpuIdle">-</span></span>
+                </div>
+                <div class="cpu-bars" id="cpuBars">
+                    <!-- Per-core bars will be inserted here -->
+                </div>
             </div>
             <div class="card">
                 <div class="card-title">Memory</div>
@@ -504,11 +740,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-value" id="uptime">-</div>
                 <div class="card-sub">node uptime</div>
             </div>
+            <div class="card">
+                <div class="card-title">Load Average</div>
+                <div class="card-value" id="loadAvg">-</div>
+                <div class="card-sub" id="loadDetails">1m / 5m / 15m</div>
+            </div>
         </div>
 
         <div class="footer">
             <p>Auto-refreshes every 5 seconds | <span id="lastUpdate">-</span></p>
-            <p style="margin-top: 10px;"><a href="https://github.com/ralfyang/bitcoin-sync-dashboard" target="_blank">GitHub</a></p>
+            <p style="margin-top: 10px;"><a href="https://github.com/Antisys/bitcoin-sync-dashboard" target="_blank">GitHub</a></p>
         </div>
     </div>
 
@@ -523,6 +764,32 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             if (num >= 1e6) return (num / 1e6).toFixed(2) + 'M';
             if (num >= 1e3) return (num / 1e3).toFixed(1) + 'K';
             return num.toLocaleString();
+        }
+
+        function renderCpuBars(perCore) {
+            if (!perCore || perCore.length === 0) return;
+
+            var container = document.getElementById('cpuBars');
+            var html = '';
+
+            for (var i = 0; i < perCore.length; i++) {
+                var core = perCore[i];
+                var usage = core.usage || 0;
+                var iowait = core.iowait || 0;
+
+                html += '<div class="cpu-bar-container">';
+                html += '<span class="cpu-bar-label">Core ' + core.core + '</span>';
+                html += '<div class="cpu-bar-bg">';
+                html += '<div class="cpu-bar cpu-bar-used" style="width: ' + usage.toFixed(1) + '%; display: inline-block;"></div>';
+                if (iowait > 0.5) {
+                    html += '<div class="cpu-bar cpu-bar-iowait" style="width: ' + iowait.toFixed(1) + '%; display: inline-block;"></div>';
+                }
+                html += '</div>';
+                html += '<span class="cpu-bar-value">' + usage.toFixed(0) + '%</span>';
+                html += '</div>';
+            }
+
+            container.innerHTML = html;
         }
 
         function updateDashboard() {
@@ -567,13 +834,34 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
                     document.getElementById('difficulty').textContent = formatCompact(data.difficulty || 0);
 
-                    // System stats
-                    if (data.load_1m !== undefined) {
-                        var loadPct = ((data.load_1m / (data.cpu_cores || 1)) * 100).toFixed(0);
-                        document.getElementById('cpuLoad').textContent = loadPct + '%';
-                        document.getElementById('cpuModel').textContent = (data.cpu_model || 'Unknown') + ' (' + (data.cpu_cores || '?') + ' cores)';
+                    // CPU stats - real utilization
+                    if (data.cpu_total_used !== undefined) {
+                        document.getElementById('cpuTotal').textContent = data.cpu_total_used.toFixed(1) + '%';
+                        document.getElementById('cpuUser').textContent = (data.cpu_user || 0).toFixed(1) + '%';
+                        document.getElementById('cpuSystem').textContent = (data.cpu_system || 0).toFixed(1) + '%';
+                        document.getElementById('cpuIowait').textContent = (data.cpu_iowait || 0).toFixed(1) + '%';
+                        document.getElementById('cpuIdle').textContent = (data.cpu_idle || 0).toFixed(1) + '%';
+                    } else {
+                        document.getElementById('cpuTotal').textContent = 'Measuring...';
                     }
 
+                    document.getElementById('cpuModel').textContent = (data.cpu_model || 'Unknown') + ' (' + (data.cpu_cores || '?') + ' cores)';
+
+                    // Per-core CPU bars
+                    if (data.cpu_per_core) {
+                        renderCpuBars(data.cpu_per_core);
+                    }
+
+                    // Load average
+                    if (data.load_1m !== undefined) {
+                        document.getElementById('loadAvg').textContent = data.load_1m.toFixed(2);
+                        document.getElementById('loadDetails').textContent =
+                            data.load_1m.toFixed(2) + ' / ' +
+                            (data.load_5m || 0).toFixed(2) + ' / ' +
+                            (data.load_15m || 0).toFixed(2);
+                    }
+
+                    // Memory
                     if (data.mem_percent !== undefined) {
                         document.getElementById('memUsage').textContent = data.mem_percent.toFixed(0) + '%';
                         document.getElementById('memDetails').textContent = (data.mem_used_human || '-') + ' / ' + (data.mem_total_human || '-');
