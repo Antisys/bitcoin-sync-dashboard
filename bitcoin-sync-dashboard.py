@@ -31,6 +31,19 @@ history_top = deque(maxlen=60)
 history_bottom = deque(maxlen=60)
 
 prev_cpu_stats = {'timestamp': 0, 'total': None, 'per_core': None}
+last_cpu_result = {'cpu_total_used': 0, 'cpu_user': 0, 'cpu_system': 0, 'cpu_iowait': 0, 'cpu_idle': 100, 'cpu_per_core': []}
+
+# Mode tracking - only switch modes after seeing consistent results
+mode_tracker = {'current_mode': None, 'consecutive_count': 0, 'confirmed_mode': None}
+
+# Cache for static info that doesn't change
+static_cache = {'version': None, 'pruned': None, 'cpu_model': None, 'cpu_cores': None}
+
+# Time-based cache for slow-changing values
+timed_cache = {
+    'size_on_disk': {'value': 0, 'last_update': 0, 'ttl': 120},  # 2 minutes
+    'connections': {'value': 0, 'in': 0, 'out': 0, 'last_update': 0, 'ttl': 60},  # 1 minute
+}
 
 
 def run_command(cmd, timeout=15):
@@ -124,13 +137,13 @@ def calculate_per_core_usage(prev_cores, curr_cores):
 
 
 def get_cpu_stats():
-    global prev_cpu_stats
+    global prev_cpu_stats, last_cpu_result
     stats = {}
     stat_output = run_command("cat /proc/stat")
     current_time = time.time()
     current_stats = parse_proc_stat(stat_output)
 
-    if prev_cpu_stats['total'] and (current_time - prev_cpu_stats['timestamp']) >= 1:
+    if prev_cpu_stats['total'] and (current_time - prev_cpu_stats['timestamp']) >= 0.3:
         cpu_usage = calculate_cpu_usage(prev_cpu_stats['total'], current_stats['total'])
         if cpu_usage:
             stats['cpu_total_used'] = cpu_usage['total_used']
@@ -138,25 +151,40 @@ def get_cpu_stats():
             stats['cpu_system'] = cpu_usage['system']
             stats['cpu_iowait'] = cpu_usage['iowait']
             stats['cpu_idle'] = cpu_usage['idle']
+            last_cpu_result.update(stats)
         per_core = calculate_per_core_usage(prev_cpu_stats['per_core'], current_stats['per_core'])
         if per_core:
             stats['cpu_per_core'] = per_core
+            last_cpu_result['cpu_per_core'] = per_core
+        prev_cpu_stats = {'timestamp': current_time, 'total': current_stats['total'], 'per_core': current_stats['per_core']}
+    elif not prev_cpu_stats['total']:
+        # First call - just store baseline
+        prev_cpu_stats = {'timestamp': current_time, 'total': current_stats['total'], 'per_core': current_stats['per_core']}
 
-    prev_cpu_stats = {'timestamp': current_time, 'total': current_stats['total'], 'per_core': current_stats['per_core']}
+    # Return last known values if current calculation failed
+    if not stats:
+        stats = last_cpu_result.copy()
     return stats
 
 
 def get_system_stats():
     stats = {}
-    cpu_info = run_command("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2")
-    if cpu_info:
-        stats['cpu_model'] = cpu_info.strip()
-    nproc = run_command("nproc")
-    if nproc:
-        try:
-            stats['cpu_cores'] = int(nproc)
-        except ValueError:
-            pass
+    # Cache static CPU info
+    if static_cache['cpu_model']:
+        stats['cpu_model'] = static_cache['cpu_model']
+        stats['cpu_cores'] = static_cache['cpu_cores']
+    else:
+        cpu_info = run_command("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2")
+        if cpu_info:
+            static_cache['cpu_model'] = cpu_info.strip()
+            stats['cpu_model'] = static_cache['cpu_model']
+        nproc = run_command("nproc")
+        if nproc:
+            try:
+                static_cache['cpu_cores'] = int(nproc)
+                stats['cpu_cores'] = static_cache['cpu_cores']
+            except ValueError:
+                pass
     cpu_stats = get_cpu_stats()
     stats.update(cpu_stats)
 
@@ -182,7 +210,9 @@ def get_system_stats():
 
 
 def get_bitcoin_stats():
-    stats = {'sync_mode': 'normal', 'assumeutxo': False}
+    global mode_tracker
+    stats = {'sync_mode': 'normal', 'assumeutxo': False, 'mode_confirmed': False}
+    detected_mode = 'unknown'
 
     # Try getchainstates first (for assumeutxo detection)
     chainstates = run_bitcoin_cli("getchainstates")
@@ -194,6 +224,7 @@ def get_bitcoin_stats():
 
             if len(states) == 2:
                 # AssumeUTXO mode - two chainstates
+                detected_mode = 'assumeutxo'
                 stats['assumeutxo'] = True
                 stats['sync_mode'] = 'assumeutxo'
 
@@ -210,27 +241,26 @@ def get_bitcoin_stats():
                         stats['bottom_progress'] = state.get('verificationprogress', 0) * 100
 
                 # Calculate combined progress
-                # Total chain = headers, snapshot at 840000
-                # Bottom syncs 0 -> 840000, Top syncs 840000 -> headers
                 snapshot = stats.get('snapshot_height', 840000)
                 headers = stats['headers']
                 bottom = stats.get('bottom_height', 0)
                 top = stats.get('top_height', snapshot)
 
-                # Bottom percentage (of total chain)
                 stats['bottom_pct'] = (bottom / headers) * 100 if headers > 0 else 0
-                # Top percentage (of total chain) - starts at snapshot position
                 stats['top_pct'] = (top / headers) * 100 if headers > 0 else 0
-                # Snapshot position in the bar
                 stats['snapshot_pct'] = (snapshot / headers) * 100 if headers > 0 else 0
 
-                stats['height'] = top  # Current usable height
+                stats['height'] = top
                 stats['ibd'] = top < headers
 
-        except json.JSONDecodeError:
-            pass
+            elif len(states) == 1:
+                # Single chainstate - normal mode confirmed
+                detected_mode = 'normal'
 
-    # Fallback to regular getblockchaininfo
+        except json.JSONDecodeError:
+            detected_mode = 'unknown'
+
+    # Fallback to regular getblockchaininfo for normal mode data
     if not stats.get('assumeutxo'):
         info = run_bitcoin_cli("getblockchaininfo")
         if info:
@@ -242,31 +272,91 @@ def get_bitcoin_stats():
                 stats['ibd'] = data.get('initialblockdownload', True)
                 stats['size_on_disk'] = data.get('size_on_disk', 0)
                 stats['pruned'] = data.get('pruned', False)
+                if detected_mode == 'unknown':
+                    detected_mode = 'normal'
             except json.JSONDecodeError:
                 pass
 
-    # Get network info
-    netinfo = run_bitcoin_cli("getnetworkinfo")
-    if netinfo:
-        try:
-            data = json.loads(netinfo)
-            stats['version'] = data.get('subversion', 'unknown')
-            stats['connections'] = data.get('connections', 0)
-            stats['connections_in'] = data.get('connections_in', 0)
-            stats['connections_out'] = data.get('connections_out', 0)
-        except json.JSONDecodeError:
-            pass
+    # Mode confirmation logic - sticky once confirmed
+    if detected_mode != 'unknown':
+        if detected_mode == mode_tracker['current_mode']:
+            mode_tracker['consecutive_count'] += 1
+        else:
+            mode_tracker['current_mode'] = detected_mode
+            mode_tracker['consecutive_count'] = 1
 
-    # Get size on disk if not already set
-    if 'size_on_disk' not in stats:
+        # First time: confirm after 3 readings
+        # After confirmed: require 5 consecutive different readings to switch
+        if mode_tracker['confirmed_mode'] is None:
+            if mode_tracker['consecutive_count'] >= 3:
+                mode_tracker['confirmed_mode'] = detected_mode
+        elif detected_mode != mode_tracker['confirmed_mode'] and mode_tracker['consecutive_count'] >= 5:
+            mode_tracker['confirmed_mode'] = detected_mode
+
+    # Use confirmed mode for output
+    if mode_tracker['confirmed_mode']:
+        stats['sync_mode'] = mode_tracker['confirmed_mode']
+        stats['assumeutxo'] = (mode_tracker['confirmed_mode'] == 'assumeutxo')
+        stats['mode_confirmed'] = True
+    else:
+        stats['mode_confirmed'] = False
+
+    # Get network info - cache version, timed cache for connections
+    now = time.time()
+    if static_cache['version']:
+        stats['version'] = static_cache['version']
+        # Check if connections cache is still valid
+        if now - timed_cache['connections']['last_update'] < timed_cache['connections']['ttl']:
+            stats['connections'] = timed_cache['connections']['value']
+            stats['connections_in'] = timed_cache['connections']['in']
+            stats['connections_out'] = timed_cache['connections']['out']
+        else:
+            peerinfo = run_bitcoin_cli("getconnectioncount")
+            if peerinfo:
+                try:
+                    timed_cache['connections']['value'] = int(peerinfo)
+                    timed_cache['connections']['last_update'] = now
+                    stats['connections'] = timed_cache['connections']['value']
+                    stats['connections_in'] = 0
+                    stats['connections_out'] = stats['connections']
+                except ValueError:
+                    stats['connections'] = timed_cache['connections']['value']
+    else:
+        netinfo = run_bitcoin_cli("getnetworkinfo")
+        if netinfo:
+            try:
+                data = json.loads(netinfo)
+                static_cache['version'] = data.get('subversion', 'unknown')
+                stats['version'] = static_cache['version']
+                timed_cache['connections']['value'] = data.get('connections', 0)
+                timed_cache['connections']['in'] = data.get('connections_in', 0)
+                timed_cache['connections']['out'] = data.get('connections_out', 0)
+                timed_cache['connections']['last_update'] = now
+                stats['connections'] = timed_cache['connections']['value']
+                stats['connections_in'] = timed_cache['connections']['in']
+                stats['connections_out'] = timed_cache['connections']['out']
+            except json.JSONDecodeError:
+                pass
+
+    # Get size on disk - use timed cache (2 min TTL)
+    now = time.time()
+    if now - timed_cache['size_on_disk']['last_update'] < timed_cache['size_on_disk']['ttl']:
+        stats['size_on_disk'] = timed_cache['size_on_disk']['value']
+        if static_cache['pruned'] is not None:
+            stats['pruned'] = static_cache['pruned']
+    else:
         info = run_bitcoin_cli("getblockchaininfo")
         if info:
             try:
                 data = json.loads(info)
-                stats['size_on_disk'] = data.get('size_on_disk', 0)
-                stats['pruned'] = data.get('pruned', False)
+                timed_cache['size_on_disk']['value'] = data.get('size_on_disk', 0)
+                timed_cache['size_on_disk']['last_update'] = now
+                stats['size_on_disk'] = timed_cache['size_on_disk']['value']
+                static_cache['pruned'] = data.get('pruned', False)
+                stats['pruned'] = static_cache['pruned']
             except json.JSONDecodeError:
-                pass
+                stats['size_on_disk'] = timed_cache['size_on_disk']['value']
+                stats['pruned'] = static_cache['pruned'] or False
 
     stats['timestamp'] = time.time()
     return stats
@@ -416,7 +506,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             top: 0;
             height: 100%;
             background: linear-gradient(90deg, #2196F3 0%, #64B5F6 100%);
-            transition: width 0.5s ease;
             z-index: 1;
         }
         .bar-top {
@@ -424,7 +513,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             top: 0;
             height: 100%;
             background: linear-gradient(90deg, #FF9800 0%, #f7931a 100%);
-            transition: left 0.5s ease, width 0.5s ease;
             z-index: 2;
         }
         .bar-snapshot-marker {
@@ -570,11 +658,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
         <div class="grid">
             <div class="card">
-                <div class="card-title">Current Height</div>
-                <div class="card-value" id="currentHeight">-</div>
-                <div class="card-sub" id="heightSub">-</div>
-            </div>
-            <div class="card">
                 <div class="card-title">Connections</div>
                 <div class="card-value" id="connections">-</div>
                 <div class="card-sub" id="connSub">-</div>
@@ -617,12 +700,92 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         </div>
 
         <div class="footer">
-            <p>Auto-refreshes every 5 seconds | <span id="lastUpdate">-</span></p>
+            <p>Blocks: 60s, CPU: 5s | <span id="lastUpdate">-</span></p>
         </div>
     </div>
 
     <script>
+        let lastKnownMode = null;
+        let lastData = null;
+        let lastFetchTime = 0;
+
         function fmt(n) { return n.toLocaleString(); }
+
+        function resetBars() {
+            document.getElementById('barBottom').style.width = '0%';
+            document.getElementById('barTop').style.left = '0%';
+            document.getElementById('barTop').style.width = '0%';
+            document.getElementById('snapshotMarker').style.display = 'none';
+        }
+
+        function interpolate() {
+            if (!lastData || !lastData.mode_confirmed) return;
+
+            const elapsed = (Date.now() - lastFetchTime) / 1000;
+            const d = lastData;
+            const headers = d.headers || 0;
+
+            if (d.assumeutxo) {
+                // Interpolate both syncs - use 80% of speed to be conservative
+                const snapshot = d.snapshot_height || 840000;
+                const topSpeed = (d.speed_top || 0) * 0.8;
+                const bottomSpeed = (d.speed_bottom || 0) * 0.8;
+                const estTop = Math.min((d.top_height || 0) + (topSpeed * elapsed), headers);
+                const estBottom = Math.min((d.bottom_height || 0) + (bottomSpeed * elapsed), snapshot);
+
+                const snapshotPct = (snapshot / headers) * 100;
+                const topPct = (estTop / headers) * 100;
+                const bottomPct = (estBottom / headers) * 100;
+
+                // Update progress bars
+                document.getElementById('barBottom').style.width = bottomPct + '%';
+                document.getElementById('barTop').style.left = snapshotPct + '%';
+                document.getElementById('barTop').style.width = (topPct - snapshotPct) + '%';
+                document.getElementById('labelBottom').textContent = fmt(Math.floor(estBottom));
+                document.getElementById('labelTop').textContent = fmt(Math.floor(estTop));
+
+                // Update stats boxes
+                const bottomRemain = snapshot - Math.floor(estBottom);
+                const topRemain = headers - Math.floor(estTop);
+                document.getElementById('bottomStats').innerHTML =
+                    `Block ${fmt(Math.floor(estBottom))} / ${fmt(snapshot)}<br>` +
+                    `<span style="font-size:0.7em">${fmt(bottomRemain)} remaining` +
+                    (d.speed_bottom ? ` @ ${d.speed_bottom.toFixed(1)} b/s` : '') +
+                    (d.eta_bottom_human ? ` (ETA: ${d.eta_bottom_human})` : '') + `</span>`;
+                document.getElementById('topStats').innerHTML =
+                    `Block ${fmt(Math.floor(estTop))} / ${fmt(headers)}<br>` +
+                    `<span style="font-size:0.7em">${fmt(topRemain)} remaining` +
+                    (d.speed_top ? ` @ ${d.speed_top.toFixed(1)} b/s` : '') +
+                    (d.eta_top_human ? ` (ETA: ${d.eta_top_human})` : '') + `</span>`;
+            } else {
+                // Normal sync interpolation - use 80% of speed to be conservative
+                const speed = (d.speed || 0) * 0.8;
+                const estHeight = Math.min((d.height || 0) + (speed * elapsed), headers);
+                const pct = headers > 0 ? (estHeight / headers) * 100 : 0;
+
+                document.getElementById('barTop').style.width = pct + '%';
+                document.getElementById('labelTop').textContent = fmt(Math.floor(estHeight)) + ' (' + pct.toFixed(2) + '%)';
+            }
+        }
+
+        function updateCpu() {
+            fetch('/api/cpu').then(r => r.json()).then(d => {
+                if (d.cpu_total_used !== undefined) {
+                    document.getElementById('cpuUsage').textContent = d.cpu_total_used.toFixed(1) + '%';
+                }
+                if (d.cpu_model) {
+                    document.getElementById('cpuModel').textContent = d.cpu_model + ' (' + (d.cpu_cores || '?') + ' cores)';
+                }
+                renderCpuBars(d.cpu_per_core);
+                if (d.mem_percent !== undefined) {
+                    document.getElementById('memUsage').textContent = d.mem_percent.toFixed(0) + '%';
+                    document.getElementById('memDetails').textContent = (d.mem_used_human||'-') + ' / ' + (d.mem_total_human||'-');
+                }
+                if (d.uptime_human) {
+                    document.getElementById('uptime').textContent = d.uptime_human;
+                }
+            }).catch(() => {});
+        }
 
         function renderCpuBars(cores) {
             if (!cores) return;
@@ -650,8 +813,21 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     return;
                 }
 
+                // Don't update progress bar until mode is confirmed
+                if (!d.mode_confirmed) {
+                    document.getElementById('statusText').textContent = 'Detecting mode...';
+                    return;
+                }
+
                 const isAssume = d.assumeutxo;
                 const headers = d.headers || 0;
+                const currentMode = isAssume ? 'assumeutxo' : 'normal';
+
+                // Reset bars if mode changed
+                if (lastKnownMode !== null && lastKnownMode !== currentMode) {
+                    resetBars();
+                }
+                lastKnownMode = currentMode;
 
                 // Mode indicator
                 document.getElementById('modeIndicator').textContent = isAssume ? 'AssumeUTXO' : 'Normal Sync';
@@ -729,8 +905,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 }
 
                 // Common stats
-                document.getElementById('currentHeight').textContent = fmt(d.height || d.top_height || 0);
-                document.getElementById('heightSub').textContent = 'of ' + fmt(headers) + ' blocks';
 
                 document.getElementById('connections').textContent = d.connections || 0;
                 document.getElementById('connSub').textContent = (d.connections_in||0) + ' in / ' + (d.connections_out||0) + ' out';
@@ -755,13 +929,25 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('uptime').textContent = d.uptime_human || '-';
                 document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
 
+                // Store for interpolation
+                lastData = d;
+                lastFetchTime = Date.now();
+
             }).catch(e => {
                 document.getElementById('statusText').textContent = 'Connection Error';
             });
         }
 
+        // Fast initial load - CPU/system stats first
+        updateCpu();
+        document.getElementById('statusText').textContent = 'Loading blockchain...';
+
+        // Then load blockchain data (slow)
         update();
-        setInterval(update, 5000);
+
+        setInterval(update, 60000);  // Fetch real data every 60s
+        setInterval(interpolate, 1000);  // Smooth block updates every 1s
+        setInterval(updateCpu, 5000);  // CPU/memory updates every 5s
     </script>
 </body>
 </html>'''
@@ -798,6 +984,18 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 stats = {'error': 'Could not fetch stats'}
 
+            self.wfile.write(json.dumps(stats).encode())
+
+        elif path == '/api/cpu':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            stats = get_system_stats()
+            if 'mem_total' in stats:
+                stats['mem_total_human'] = format_bytes(stats['mem_total'])
+                stats['mem_used_human'] = format_bytes(stats['mem_used'])
             self.wfile.write(json.dumps(stats).encode())
 
         elif path == '/health':
