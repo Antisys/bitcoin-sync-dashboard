@@ -1,36 +1,11 @@
 #!/usr/bin/env python3
 """
-Bitcoin Sync Dashboard
+Bitcoin Sync Dashboard with AssumeUTXO Support
 
-A real-time web dashboard for monitoring Bitcoin Core initial block download (IBD) progress.
-Features realistic ETA calculation that accounts for increasing block sizes over time.
-
-No external dependencies - uses only Python standard library.
-
-Usage:
-    python3 bitcoin-sync-dashboard.py [options]
-
-Options:
-    --host HOST         Bitcoin node hostname/IP (default: localhost)
-    --ssh-user USER     SSH username for remote nodes (default: current user)
-    --port PORT         Dashboard web port (default: 8888)
-    --rpc-host HOST     Bitcoin RPC host (default: 127.0.0.1)
-    --rpc-port PORT     Bitcoin RPC port (default: 8332)
-    --docker CONTAINER  Docker container name if bitcoind runs in Docker
-    --help              Show this help message
-
-Examples:
-    # Local bitcoind
-    python3 bitcoin-sync-dashboard.py
-
-    # Remote node via SSH
-    python3 bitcoin-sync-dashboard.py --host 192.168.1.100 --ssh-user ralf
-
-    # Docker container
-    python3 bitcoin-sync-dashboard.py --docker bitcoind
-
-    # Remote Docker via SSH
-    python3 bitcoin-sync-dashboard.py --host 192.168.1.100 --ssh-user ralf --docker bitcoind
+Shows a unified progress bar with:
+- Left side: Background validation (0 → snapshot height)
+- Middle: The loaded snapshot
+- Right side: Catching up to tip (snapshot → current tip)
 """
 
 import subprocess
@@ -43,48 +18,29 @@ import os
 from urllib.parse import urlparse
 from collections import deque
 
-# Configuration (set via command line args)
 CONFIG = {
     'host': 'localhost',
     'ssh_user': os.environ.get('USER', 'root'),
-    'port': 8888,
+    'port': 8890,
     'rpc_host': '127.0.0.1',
     'rpc_port': 8332,
     'docker_container': None,
 }
 
-# Store historical data for speed calculation
-history = deque(maxlen=60)
+history_top = deque(maxlen=60)
+history_bottom = deque(maxlen=60)
 
-# Store previous CPU stats for delta calculation
-prev_cpu_stats = {
-    'timestamp': 0,
-    'total': None,
-    'per_core': None
-}
+prev_cpu_stats = {'timestamp': 0, 'total': None, 'per_core': None}
 
 
 def run_command(cmd, timeout=15):
-    """Run a command locally or via SSH depending on config"""
     try:
         if CONFIG['host'] == 'localhost' or CONFIG['host'] == '127.0.0.1':
-            # Local execution
-            result = subprocess.run(
-                cmd, shell=True,
-                capture_output=True, text=True, timeout=timeout
-            )
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         else:
-            # Remote execution via SSH
-            ssh_cmd = [
-                "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
-                f"{CONFIG['ssh_user']}@{CONFIG['host']}",
-                cmd
-            ]
-            result = subprocess.run(
-                ssh_cmd,
-                capture_output=True, text=True, timeout=timeout
-            )
-
+            ssh_cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+                       f"{CONFIG['ssh_user']}@{CONFIG['host']}", cmd]
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode == 0:
             return result.stdout.strip()
         return None
@@ -93,152 +49,88 @@ def run_command(cmd, timeout=15):
 
 
 def run_bitcoin_cli(rpc_cmd):
-    """Run bitcoin-cli command"""
     if CONFIG['docker_container']:
-        cmd = f"docker exec {CONFIG['docker_container']} bitcoin-cli {rpc_cmd}"
+        cmd = f"docker exec {CONFIG['docker_container']} bitcoin-cli -rpcuser=bitcoin -rpcpassword=bitcoinrpc {rpc_cmd}"
     else:
         cmd = f"bitcoin-cli -rpcconnect={CONFIG['rpc_host']} -rpcport={CONFIG['rpc_port']} {rpc_cmd}"
-
     return run_command(cmd)
 
 
 def parse_proc_stat(stat_output):
-    """
-    Parse /proc/stat output and return CPU times.
-
-    Format: cpu user nice system idle iowait irq softirq steal guest guest_nice
-    Returns dict with: user, nice, system, idle, iowait, irq, softirq, total
-    """
     result = {'total': None, 'per_core': []}
-
     if not stat_output:
         return result
-
     for line in stat_output.split('\n'):
         parts = line.split()
         if not parts:
             continue
-
         if parts[0] == 'cpu':
-            # Total CPU line
             try:
-                times = [int(x) for x in parts[1:8]]  # user, nice, system, idle, iowait, irq, softirq
+                times = [int(x) for x in parts[1:8]]
                 result['total'] = {
-                    'user': times[0],
-                    'nice': times[1],
-                    'system': times[2],
-                    'idle': times[3],
-                    'iowait': times[4],
-                    'irq': times[5],
-                    'softirq': times[6],
-                    'total': sum(times)
+                    'user': times[0], 'nice': times[1], 'system': times[2],
+                    'idle': times[3], 'iowait': times[4], 'irq': times[5],
+                    'softirq': times[6], 'total': sum(times)
                 }
             except (ValueError, IndexError):
                 pass
-
         elif parts[0].startswith('cpu') and parts[0][3:].isdigit():
-            # Per-core CPU line (cpu0, cpu1, etc.)
             try:
                 core_num = int(parts[0][3:])
                 times = [int(x) for x in parts[1:8]]
                 result['per_core'].append({
-                    'core': core_num,
-                    'user': times[0],
-                    'nice': times[1],
-                    'system': times[2],
-                    'idle': times[3],
-                    'iowait': times[4],
-                    'irq': times[5],
-                    'softirq': times[6],
-                    'total': sum(times)
+                    'core': core_num, 'user': times[0], 'nice': times[1],
+                    'system': times[2], 'idle': times[3], 'iowait': times[4],
+                    'irq': times[5], 'softirq': times[6], 'total': sum(times)
                 })
             except (ValueError, IndexError):
                 pass
-
-    # Sort per-core by core number
     result['per_core'].sort(key=lambda x: x['core'])
     return result
 
 
 def calculate_cpu_usage(prev, curr):
-    """
-    Calculate CPU usage percentages from two /proc/stat samples.
-    Returns dict with usage percentages.
-    """
     if not prev or not curr:
         return None
-
     total_delta = curr['total'] - prev['total']
     if total_delta <= 0:
         return None
-
-    user_delta = curr['user'] - prev['user']
-    nice_delta = curr['nice'] - prev['nice']
-    system_delta = curr['system'] - prev['system']
-    idle_delta = curr['idle'] - prev['idle']
-    iowait_delta = curr['iowait'] - prev['iowait']
-    irq_delta = curr['irq'] - prev['irq']
-    softirq_delta = curr['softirq'] - prev['softirq']
-
     return {
-        'user': (user_delta / total_delta) * 100,
-        'nice': (nice_delta / total_delta) * 100,
-        'system': (system_delta / total_delta) * 100,
-        'idle': (idle_delta / total_delta) * 100,
-        'iowait': (iowait_delta / total_delta) * 100,
-        'irq': (irq_delta / total_delta) * 100,
-        'softirq': (softirq_delta / total_delta) * 100,
-        'total_used': ((total_delta - idle_delta - iowait_delta) / total_delta) * 100
+        'user': ((curr['user'] - prev['user']) / total_delta) * 100,
+        'system': ((curr['system'] - prev['system']) / total_delta) * 100,
+        'idle': ((curr['idle'] - prev['idle']) / total_delta) * 100,
+        'iowait': ((curr['iowait'] - prev['iowait']) / total_delta) * 100,
+        'total_used': ((total_delta - (curr['idle'] - prev['idle']) - (curr['iowait'] - prev['iowait'])) / total_delta) * 100
     }
 
 
 def calculate_per_core_usage(prev_cores, curr_cores):
-    """Calculate per-core CPU usage from two samples."""
-    if not prev_cores or not curr_cores:
+    if not prev_cores or not curr_cores or len(prev_cores) != len(curr_cores):
         return None
-
-    if len(prev_cores) != len(curr_cores):
-        return None
-
     result = []
     for prev, curr in zip(prev_cores, curr_cores):
         total_delta = curr['total'] - prev['total']
         if total_delta <= 0:
-            result.append({'core': curr['core'], 'usage': 0, 'iowait': 0})
+            result.append({'core': curr['core'], 'user': 0, 'system': 0, 'iowait': 0, 'idle': 100})
             continue
-
-        idle_delta = curr['idle'] - prev['idle']
-        iowait_delta = curr['iowait'] - prev['iowait']
-        used_delta = total_delta - idle_delta - iowait_delta
-
-        user_delta = curr['user'] - prev['user'] + curr['nice'] - prev['nice']
-        system_delta = curr['system'] - prev['system'] + curr['irq'] - prev['irq'] + curr['softirq'] - prev['softirq']
-
         result.append({
             'core': curr['core'],
-            'user': (user_delta / total_delta) * 100,
-            'system': (system_delta / total_delta) * 100,
-            'iowait': (iowait_delta / total_delta) * 100,
-            'idle': (idle_delta / total_delta) * 100
+            'user': ((curr['user'] - prev['user'] + curr['nice'] - prev['nice']) / total_delta) * 100,
+            'system': ((curr['system'] - prev['system'] + curr['irq'] - prev['irq'] + curr['softirq'] - prev['softirq']) / total_delta) * 100,
+            'iowait': ((curr['iowait'] - prev['iowait']) / total_delta) * 100,
+            'idle': ((curr['idle'] - prev['idle']) / total_delta) * 100
         })
-
     return result
 
 
 def get_cpu_stats():
-    """Get real CPU utilization by comparing /proc/stat samples."""
     global prev_cpu_stats
-
     stats = {}
-
-    # Get current /proc/stat
     stat_output = run_command("cat /proc/stat")
     current_time = time.time()
     current_stats = parse_proc_stat(stat_output)
 
-    # Calculate usage if we have a previous sample (at least 1 second ago)
     if prev_cpu_stats['total'] and (current_time - prev_cpu_stats['timestamp']) >= 1:
-        # Total CPU usage
         cpu_usage = calculate_cpu_usage(prev_cpu_stats['total'], current_stats['total'])
         if cpu_usage:
             stats['cpu_total_used'] = cpu_usage['total_used']
@@ -246,56 +138,28 @@ def get_cpu_stats():
             stats['cpu_system'] = cpu_usage['system']
             stats['cpu_iowait'] = cpu_usage['iowait']
             stats['cpu_idle'] = cpu_usage['idle']
-
-        # Per-core usage
         per_core = calculate_per_core_usage(prev_cpu_stats['per_core'], current_stats['per_core'])
         if per_core:
             stats['cpu_per_core'] = per_core
 
-    # Store current as previous for next call
-    prev_cpu_stats = {
-        'timestamp': current_time,
-        'total': current_stats['total'],
-        'per_core': current_stats['per_core']
-    }
-
+    prev_cpu_stats = {'timestamp': current_time, 'total': current_stats['total'], 'per_core': current_stats['per_core']}
     return stats
 
 
 def get_system_stats():
-    """Fetch system stats from the node"""
     stats = {}
-
-    # Get CPU info
     cpu_info = run_command("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2")
     if cpu_info:
         stats['cpu_model'] = cpu_info.strip()
-
-    # Get CPU cores
     nproc = run_command("nproc")
     if nproc:
         try:
             stats['cpu_cores'] = int(nproc)
         except ValueError:
             pass
-
-    # Get real CPU utilization
     cpu_stats = get_cpu_stats()
     stats.update(cpu_stats)
 
-    # Get load average (still useful as a secondary metric)
-    load_info = run_command("cat /proc/loadavg")
-    if load_info:
-        parts = load_info.split()
-        if len(parts) >= 3:
-            try:
-                stats['load_1m'] = float(parts[0])
-                stats['load_5m'] = float(parts[1])
-                stats['load_15m'] = float(parts[2])
-            except ValueError:
-                pass
-
-    # Get memory info
     mem_info = run_command("free -b | grep Mem")
     if mem_info:
         parts = mem_info.split()
@@ -303,13 +167,10 @@ def get_system_stats():
             try:
                 stats['mem_total'] = int(parts[1])
                 stats['mem_used'] = int(parts[2])
-                stats['mem_free'] = int(parts[3])
-                stats['mem_available'] = int(parts[6])
                 stats['mem_percent'] = (stats['mem_used'] / stats['mem_total']) * 100
             except (ValueError, ZeroDivisionError):
                 pass
 
-    # Get uptime
     uptime_info = run_command("cat /proc/uptime")
     if uptime_info:
         try:
@@ -317,29 +178,72 @@ def get_system_stats():
             stats['uptime_human'] = format_duration(stats['uptime_seconds'])
         except (ValueError, IndexError):
             pass
-
     return stats
 
 
 def get_bitcoin_stats():
-    """Fetch all Bitcoin stats"""
-    stats = {}
+    stats = {'sync_mode': 'normal', 'assumeutxo': False}
 
-    # Get blockchain info
-    info = run_bitcoin_cli("getblockchaininfo")
-    if info:
+    # Try getchainstates first (for assumeutxo detection)
+    chainstates = run_bitcoin_cli("getchainstates")
+    if chainstates:
         try:
-            data = json.loads(info)
-            stats['height'] = data.get('blocks', 0)
+            data = json.loads(chainstates)
+            states = data.get('chainstates', [])
             stats['headers'] = data.get('headers', 0)
-            stats['progress'] = data.get('verificationprogress', 0) * 100
-            stats['pruned'] = data.get('pruned', False)
-            stats['size_on_disk'] = data.get('size_on_disk', 0)
-            stats['chain'] = data.get('chain', 'unknown')
-            stats['difficulty'] = data.get('difficulty', 0)
-            stats['ibd'] = data.get('initialblockdownload', True)
+
+            if len(states) == 2:
+                # AssumeUTXO mode - two chainstates
+                stats['assumeutxo'] = True
+                stats['sync_mode'] = 'assumeutxo'
+
+                # Find which is background (validated=true) and which is snapshot
+                for state in states:
+                    if state.get('snapshot_blockhash'):
+                        # This is the snapshot chainstate (syncing to tip)
+                        stats['snapshot_height'] = 840000  # Known snapshot height
+                        stats['top_height'] = state.get('blocks', 0)
+                        stats['top_progress'] = state.get('verificationprogress', 0) * 100
+                    else:
+                        # This is background validation (syncing from genesis)
+                        stats['bottom_height'] = state.get('blocks', 0)
+                        stats['bottom_progress'] = state.get('verificationprogress', 0) * 100
+
+                # Calculate combined progress
+                # Total chain = headers, snapshot at 840000
+                # Bottom syncs 0 -> 840000, Top syncs 840000 -> headers
+                snapshot = stats.get('snapshot_height', 840000)
+                headers = stats['headers']
+                bottom = stats.get('bottom_height', 0)
+                top = stats.get('top_height', snapshot)
+
+                # Bottom percentage (of total chain)
+                stats['bottom_pct'] = (bottom / headers) * 100 if headers > 0 else 0
+                # Top percentage (of total chain) - starts at snapshot position
+                stats['top_pct'] = (top / headers) * 100 if headers > 0 else 0
+                # Snapshot position in the bar
+                stats['snapshot_pct'] = (snapshot / headers) * 100 if headers > 0 else 0
+
+                stats['height'] = top  # Current usable height
+                stats['ibd'] = top < headers
+
         except json.JSONDecodeError:
             pass
+
+    # Fallback to regular getblockchaininfo
+    if not stats.get('assumeutxo'):
+        info = run_bitcoin_cli("getblockchaininfo")
+        if info:
+            try:
+                data = json.loads(info)
+                stats['height'] = data.get('blocks', 0)
+                stats['headers'] = data.get('headers', 0)
+                stats['progress'] = data.get('verificationprogress', 0) * 100
+                stats['ibd'] = data.get('initialblockdownload', True)
+                stats['size_on_disk'] = data.get('size_on_disk', 0)
+                stats['pruned'] = data.get('pruned', False)
+            except json.JSONDecodeError:
+                pass
 
     # Get network info
     netinfo = run_bitcoin_cli("getnetworkinfo")
@@ -353,137 +257,87 @@ def get_bitcoin_stats():
         except json.JSONDecodeError:
             pass
 
+    # Get size on disk if not already set
+    if 'size_on_disk' not in stats:
+        info = run_bitcoin_cli("getblockchaininfo")
+        if info:
+            try:
+                data = json.loads(info)
+                stats['size_on_disk'] = data.get('size_on_disk', 0)
+                stats['pruned'] = data.get('pruned', False)
+            except json.JSONDecodeError:
+                pass
+
     stats['timestamp'] = time.time()
     return stats
 
 
-def calculate_realistic_eta(current_height, target_height, current_speed):
-    """
-    Calculate realistic ETA based on block eras.
-
-    Block processing speed varies dramatically by era due to block size:
-    - Era 1 (0-200k, 2009-2012): Tiny blocks, ~1KB avg - baseline speed
-    - Era 2 (200k-400k, 2012-2016): Small blocks, ~200KB avg - 2x slower
-    - Era 3 (400k-500k, 2016-2018): Growing blocks, ~800KB avg - 5x slower
-    - Era 4 (500k-700k, 2018-2021): Full blocks, ~1.2MB avg - 8x slower
-    - Era 5 (700k-850k, 2021-2023): SegWit full, ~1.5MB avg - 12x slower
-    - Era 6 (850k+, 2023+): Inscriptions/Ordinals, ~2MB avg - 20x slower
-    """
-
-    # Define eras: (start_height, end_height, slowdown_factor relative to era 1)
-    eras = [
-        (0,       200000,  1.0),    # 2009-2012: tiny blocks
-        (200000,  400000,  2.0),    # 2012-2016: small blocks
-        (400000,  500000,  5.0),    # 2016-2018: growing blocks
-        (500000,  700000,  8.0),    # 2018-2021: full blocks
-        (700000,  850000,  12.0),   # 2021-2023: SegWit era
-        (850000,  9999999, 20.0),   # 2023+: Inscriptions era
-    ]
-
-    # Determine which era we're currently in to get base speed
-    current_era_factor = 1.0
-    for start, end, factor in eras:
-        if start <= current_height < end:
-            current_era_factor = factor
-            break
-
-    # Base speed normalized to era 1
-    base_speed = current_speed * current_era_factor
-
-    # Calculate time for each remaining era segment
-    total_seconds = 0
-
-    for start, end, factor in eras:
-        # Calculate overlap with remaining blocks
-        segment_start = max(start, current_height)
-        segment_end = min(end, target_height)
-
-        if segment_start < segment_end:
-            blocks_in_segment = segment_end - segment_start
-            # Speed in this era = base_speed / factor
-            era_speed = base_speed / factor
-            if era_speed > 0:
-                segment_time = blocks_in_segment / era_speed
-                total_seconds += segment_time
-
-    return total_seconds
-
-
-def calculate_speed_and_eta(stats):
-    """Calculate sync speed and ETA based on history with realistic slowdown model"""
-    if 'height' not in stats:
-        return stats
-
-    current_height = stats['height']
+def calculate_speed(stats):
     current_time = stats['timestamp']
 
-    history.append((current_time, current_height))
+    if stats.get('assumeutxo'):
+        # Track both sync directions
+        top_height = stats.get('top_height', 0)
+        bottom_height = stats.get('bottom_height', 0)
 
-    if len(history) >= 2:
-        # Short-term speed (last 10 samples)
-        short_window = list(history)[-10:]
-        if len(short_window) >= 2:
-            time_diff = short_window[-1][0] - short_window[0][0]
-            block_diff = short_window[-1][1] - short_window[0][1]
-            if time_diff > 0:
-                stats['speed_short'] = block_diff / time_diff
-            else:
-                stats['speed_short'] = 0
+        history_top.append((current_time, top_height))
+        history_bottom.append((current_time, bottom_height))
 
-        # Long-term speed
-        time_diff = history[-1][0] - history[0][0]
-        block_diff = history[-1][1] - history[0][1]
-        if time_diff > 0:
-            stats['speed_long'] = block_diff / time_diff
-        else:
-            stats['speed_long'] = 0
+        # Calculate top speed (toward tip)
+        if len(history_top) >= 2:
+            t_diff = history_top[-1][0] - history_top[0][0]
+            b_diff = history_top[-1][1] - history_top[0][1]
+            stats['speed_top'] = b_diff / t_diff if t_diff > 0 else 0
 
-        # Realistic ETA calculation accounting for block size growth
-        target_height = stats.get('headers', 0)
-        blocks_remaining = target_height - current_height
+        # Calculate bottom speed (background validation)
+        if len(history_bottom) >= 2:
+            t_diff = history_bottom[-1][0] - history_bottom[0][0]
+            b_diff = history_bottom[-1][1] - history_bottom[0][1]
+            stats['speed_bottom'] = b_diff / t_diff if t_diff > 0 else 0
 
-        if blocks_remaining > 0 and stats.get('speed_short', 0) > 0:
-            eta_seconds = calculate_realistic_eta(
-                current_height,
-                target_height,
-                stats['speed_short']
-            )
-            stats['eta_seconds'] = eta_seconds
-            stats['eta_human'] = format_duration(eta_seconds)
-        else:
-            stats['eta_human'] = 'Calculating...'
+        # ETA for top sync (to tip)
+        remaining_top = stats['headers'] - top_height
+        if stats.get('speed_top', 0) > 0:
+            stats['eta_top'] = remaining_top / stats['speed_top']
+            stats['eta_top_human'] = format_duration(stats['eta_top'])
+
+        # ETA for bottom sync (to snapshot)
+        remaining_bottom = stats.get('snapshot_height', 840000) - bottom_height
+        if stats.get('speed_bottom', 0) > 0:
+            stats['eta_bottom'] = remaining_bottom / stats['speed_bottom']
+            stats['eta_bottom_human'] = format_duration(stats['eta_bottom'])
     else:
-        stats['speed_short'] = 0
-        stats['speed_long'] = 0
-        stats['eta_human'] = 'Calculating...'
+        # Normal sync
+        history_top.append((current_time, stats.get('height', 0)))
+        if len(history_top) >= 2:
+            t_diff = history_top[-1][0] - history_top[0][0]
+            b_diff = history_top[-1][1] - history_top[0][1]
+            stats['speed'] = b_diff / t_diff if t_diff > 0 else 0
+            remaining = stats.get('headers', 0) - stats.get('height', 0)
+            if stats['speed'] > 0:
+                stats['eta'] = remaining / stats['speed']
+                stats['eta_human'] = format_duration(stats['eta'])
 
-    stats['blocks_remaining'] = stats.get('headers', 0) - current_height
     return stats
 
 
 def format_duration(seconds):
-    """Format seconds into human readable duration"""
     if seconds < 60:
         return f"{int(seconds)}s"
     elif seconds < 3600:
         return f"{int(seconds/60)}m {int(seconds%60)}s"
     elif seconds < 86400:
-        hours = int(seconds / 3600)
-        mins = int((seconds % 3600) / 60)
-        return f"{hours}h {mins}m"
+        return f"{int(seconds/3600)}h {int((seconds%3600)/60)}m"
     else:
-        days = int(seconds / 86400)
-        hours = int((seconds % 86400) / 3600)
-        return f"{days}d {hours}h"
+        return f"{int(seconds/86400)}d {int((seconds%86400)/3600)}h"
 
 
-def format_bytes(bytes_val):
-    """Format bytes into human readable size"""
+def format_bytes(b):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes_val < 1024:
-            return f"{bytes_val:.1f} {unit}"
-        bytes_val /= 1024
-    return f"{bytes_val:.1f} PB"
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
 
 
 DASHBOARD_HTML = '''<!DOCTYPE html>
@@ -495,7 +349,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: 'Segoe UI', Tahoma, sans-serif;
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             color: #eee;
             min-height: 100vh;
@@ -508,14 +362,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             color: #f7931a;
             text-shadow: 0 0 20px rgba(247, 147, 26, 0.3);
         }
-        h2 {
-            color: #888;
-            margin-bottom: 20px;
-            font-weight: normal;
-        }
+        h2 { color: #888; margin-bottom: 20px; font-weight: normal; }
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }
@@ -523,13 +373,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             background: rgba(255,255,255,0.05);
             border-radius: 15px;
             padding: 25px;
-            backdrop-filter: blur(10px);
             border: 1px solid rgba(255,255,255,0.1);
-            transition: transform 0.3s, box-shadow 0.3s;
-        }
-        .card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
         }
         .card-title {
             font-size: 0.85em;
@@ -538,43 +382,100 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             letter-spacing: 1px;
             margin-bottom: 10px;
         }
-        .card-value {
-            font-size: 2em;
-            font-weight: bold;
-            color: #fff;
-        }
-        .card-sub {
-            font-size: 0.9em;
-            color: #666;
-            margin-top: 5px;
-        }
+        .card-value { font-size: 1.8em; font-weight: bold; color: #fff; word-break: break-word; }
+        .card-value-small { font-size: 1.1em; font-weight: bold; color: #fff; word-break: break-word; }
+        .card-sub { font-size: 0.9em; color: #666; margin-top: 5px; }
+
         .progress-container {
             background: rgba(255,255,255,0.1);
             border-radius: 15px;
             padding: 30px;
             margin-bottom: 30px;
         }
-        .progress-bar-bg {
-            background: rgba(0,0,0,0.3);
+        .mode-indicator {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            margin-bottom: 15px;
+        }
+        .mode-assumeutxo { background: #4CAF50; color: white; }
+        .mode-normal { background: #2196F3; color: white; }
+
+        .unified-bar-container {
+            position: relative;
+            height: 50px;
+            background: rgba(0,0,0,0.4);
             border-radius: 10px;
-            height: 30px;
-            overflow: hidden;
             margin: 20px 0;
+            overflow: hidden;
         }
-        .progress-bar {
-            background: linear-gradient(90deg, #f7931a 0%, #ffcc00 100%);
+        .bar-bottom {
+            position: absolute;
+            left: 0;
+            top: 0;
             height: 100%;
-            border-radius: 10px;
+            background: linear-gradient(90deg, #2196F3 0%, #64B5F6 100%);
             transition: width 0.5s ease;
-            box-shadow: 0 0 20px rgba(247, 147, 26, 0.5);
+            z-index: 1;
         }
-        .progress-text {
+        .bar-top {
+            position: absolute;
+            top: 0;
+            height: 100%;
+            background: linear-gradient(90deg, #FF9800 0%, #f7931a 100%);
+            transition: left 0.5s ease, width 0.5s ease;
+            z-index: 2;
+        }
+        .bar-snapshot-marker {
+            position: absolute;
+            top: 0;
+            height: 100%;
+            width: 4px;
+            background: #fff;
+            z-index: 3;
+            box-shadow: 0 0 10px rgba(255,255,255,0.5);
+        }
+        .bar-label {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 0.85em;
+            font-weight: bold;
+            z-index: 4;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+        }
+        .bar-label-bottom { left: 10px; color: #fff; }
+        .bar-label-top { right: 10px; color: #fff; }
+        .bar-label-snapshot {
+            color: #fff;
+            font-size: 0.75em;
+            white-space: nowrap;
+        }
+
+        .progress-labels {
             display: flex;
             justify-content: space-between;
-            font-size: 1.2em;
-            flex-wrap: wrap;
-            gap: 10px;
+            font-size: 0.9em;
+            color: #888;
+            margin-top: 10px;
         }
+        .progress-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .progress-stat {
+            background: rgba(0,0,0,0.2);
+            padding: 15px;
+            border-radius: 10px;
+        }
+        .progress-stat-label { font-size: 0.8em; color: #888; }
+        .progress-stat-value { font-size: 1.3em; font-weight: bold; margin-top: 5px; }
+        .color-bottom { color: #64B5F6; }
+        .color-top { color: #f7931a; }
+
         .status-dot {
             display: inline-block;
             width: 10px;
@@ -585,93 +486,46 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         .status-syncing { background: #f7931a; }
         .status-synced { background: #00ff00; }
-        .status-error { background: #ff0000; }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        .footer {
-            text-align: center;
-            color: #555;
-            margin-top: 30px;
-            font-size: 0.9em;
-        }
-        .footer a {
-            color: #f7931a;
-            text-decoration: none;
-        }
-        .highlight { color: #f7931a; }
-        @media (max-width: 600px) {
-            .card-value { font-size: 1.5em; }
-            .progress-text { font-size: 1em; }
-        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-        /* CPU bars */
-        .cpu-bars {
+        .legend {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
             margin-top: 15px;
-        }
-        .cpu-bar-container {
-            display: flex;
-            align-items: center;
-            margin-bottom: 8px;
-            font-size: 0.85em;
-        }
-        .cpu-bar-label {
-            width: 50px;
-            color: #888;
-        }
-        .cpu-bar-bg {
-            flex: 1;
-            height: 12px;
-            background: rgba(0,0,0,0.3);
-            border-radius: 6px;
-            overflow: hidden;
-            margin-right: 10px;
-        }
-        .cpu-bar {
-            height: 100%;
-            border-radius: 6px;
-            transition: width 0.5s ease;
-        }
-        .cpu-bar-user {
-            background: #4CAF50;
-            height: 12px;
-        }
-        .cpu-bar-system {
-            background: #2196F3;
-            height: 12px;
-        }
-        .cpu-bar-iowait {
-            background: #FF9800;
-            height: 12px;
-        }
-        .cpu-bar-value {
-            width: 45px;
-            text-align: right;
-            color: #aaa;
-        }
-        .cpu-breakdown {
-            display: flex;
-            gap: 15px;
-            margin-top: 10px;
-            font-size: 0.8em;
-            color: #888;
             flex-wrap: wrap;
         }
-        .cpu-breakdown span {
+        .legend-item {
             display: flex;
             align-items: center;
-            gap: 5px;
+            gap: 8px;
+            font-size: 0.9em;
         }
-        .cpu-breakdown .dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
+        .legend-color {
+            width: 20px;
+            height: 12px;
+            border-radius: 3px;
         }
-        .dot-user { background: #4CAF50; }
-        .dot-system { background: #2196F3; }
-        .dot-iowait { background: #FF9800; }
-        .dot-idle { background: #666; }
+        .legend-bottom { background: linear-gradient(90deg, #2196F3, #64B5F6); }
+        .legend-top { background: linear-gradient(90deg, #FF9800, #f7931a); }
+        .legend-snapshot { background: #fff; width: 4px; }
+
+        .cpu-bars { margin-top: 15px; }
+        .cpu-bar-row { display: flex; align-items: center; margin-bottom: 6px; font-size: 0.8em; }
+        .cpu-bar-label { width: 50px; color: #888; }
+        .cpu-bar-bg { flex: 1; height: 10px; background: rgba(0,0,0,0.3); border-radius: 5px; overflow: hidden; display: flex; }
+        .cpu-bar-user { background: #4CAF50; height: 100%; }
+        .cpu-bar-system { background: #2196F3; height: 100%; }
+        .cpu-bar-iowait { background: #FF9800; height: 100%; }
+        .cpu-bar-val { width: 40px; text-align: right; color: #aaa; }
+        .cpu-legend { display: flex; gap: 15px; margin-top: 10px; font-size: 0.75em; color: #888; flex-wrap: wrap; }
+        .cpu-legend-item { display: flex; align-items: center; gap: 5px; }
+        .cpu-legend-color { width: 12px; height: 8px; border-radius: 2px; }
+        .cpu-legend-user { background: #4CAF50; }
+        .cpu-legend-system { background: #2196F3; }
+        .cpu-legend-iowait { background: #FF9800; }
+
+        .footer { text-align: center; color: #555; margin-top: 30px; font-size: 0.9em; }
     </style>
 </head>
 <body>
@@ -679,66 +533,75 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         <h1>&#8383; Bitcoin Sync Dashboard</h1>
 
         <div class="progress-container">
-            <div class="progress-text">
-                <span><span class="status-dot status-syncing" id="statusDot"></span><span id="status">Syncing...</span></span>
-                <span id="progressPct">0%</span>
+            <span class="mode-indicator mode-normal" id="modeIndicator">Normal Sync</span>
+            <span style="margin-left: 15px;"><span class="status-dot status-syncing" id="statusDot"></span><span id="statusText">Syncing...</span></span>
+
+            <div class="unified-bar-container" id="unifiedBar">
+                <div class="bar-bottom" id="barBottom" style="width: 0%"></div>
+                <div class="bar-top" id="barTop" style="left: 0%; width: 0%"></div>
+                <div class="bar-snapshot-marker" id="snapshotMarker" style="left: 50%; display: none;"></div>
+                <span class="bar-label bar-label-bottom" id="labelBottom"></span>
+                <span class="bar-label bar-label-top" id="labelTop"></span>
             </div>
-            <div class="progress-bar-bg">
-                <div class="progress-bar" id="progressBar" style="width: 0%"></div>
+
+            <div class="progress-labels">
+                <span>Block 0</span>
+                <span id="snapshotLabel" style="display: none;">Snapshot: 840,000</span>
+                <span id="tipLabel">Tip: 0</span>
             </div>
-            <div class="progress-text">
-                <span>Block <span id="currentBlock" class="highlight">0</span> of <span id="targetBlock">0</span></span>
-                <span>ETA: <span id="eta" class="highlight">Calculating...</span></span>
+
+            <div class="legend" id="legend">
+                <div class="legend-item"><div class="legend-color legend-bottom"></div> Background Validation</div>
+                <div class="legend-item"><div class="legend-color legend-snapshot"></div> Snapshot</div>
+                <div class="legend-item"><div class="legend-color legend-top"></div> Syncing to Tip</div>
+            </div>
+
+            <div class="progress-stats" id="progressStats">
+                <div class="progress-stat">
+                    <div class="progress-stat-label">Background Validation (0 → 840,000)</div>
+                    <div class="progress-stat-value color-bottom" id="bottomStats">-</div>
+                </div>
+                <div class="progress-stat">
+                    <div class="progress-stat-label">Catching Up (840,000 → Tip)</div>
+                    <div class="progress-stat-value color-top" id="topStats">-</div>
+                </div>
             </div>
         </div>
 
         <div class="grid">
             <div class="card">
-                <div class="card-title">Blocks Remaining</div>
-                <div class="card-value" id="blocksRemaining">-</div>
-                <div class="card-sub">blocks to sync</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Sync Speed</div>
-                <div class="card-value" id="syncSpeed">-</div>
-                <div class="card-sub">blocks per second</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Disk Usage</div>
-                <div class="card-value" id="diskUsage">-</div>
-                <div class="card-sub" id="pruneStatus">-</div>
+                <div class="card-title">Current Height</div>
+                <div class="card-value" id="currentHeight">-</div>
+                <div class="card-sub" id="heightSub">-</div>
             </div>
             <div class="card">
                 <div class="card-title">Connections</div>
                 <div class="card-value" id="connections">-</div>
-                <div class="card-sub" id="connectionDetails">in/out</div>
+                <div class="card-sub" id="connSub">-</div>
             </div>
             <div class="card">
-                <div class="card-title">Network</div>
-                <div class="card-value" id="network">-</div>
-                <div class="card-sub" id="version">-</div>
+                <div class="card-title">Disk Usage</div>
+                <div class="card-value" id="diskUsage">-</div>
+                <div class="card-sub" id="diskSub">-</div>
             </div>
             <div class="card">
-                <div class="card-title">Difficulty</div>
-                <div class="card-value" id="difficulty">-</div>
-                <div class="card-sub">current difficulty</div>
+                <div class="card-title">Version</div>
+                <div class="card-value-small" id="version">-</div>
+                <div class="card-sub" id="versionSub">-</div>
             </div>
         </div>
 
         <h2>System Resources</h2>
         <div class="grid">
-            <div class="card" style="grid-column: span 2;">
-                <div class="card-title">CPU Utilization</div>
-                <div class="card-value" id="cpuTotal">-</div>
+            <div class="card">
+                <div class="card-title">CPU</div>
+                <div class="card-value" id="cpuUsage">-</div>
                 <div class="card-sub" id="cpuModel">-</div>
-                <div class="cpu-breakdown">
-                    <span><span class="dot dot-user"></span> User: <span id="cpuUser">-</span></span>
-                    <span><span class="dot dot-system"></span> System: <span id="cpuSystem">-</span></span>
-                    <span><span class="dot dot-iowait"></span> I/O Wait: <span id="cpuIowait">-</span></span>
-                    <span><span class="dot dot-idle"></span> Idle: <span id="cpuIdle">-</span></span>
-                </div>
-                <div class="cpu-bars" id="cpuBars">
-                    <!-- Per-core bars will be inserted here -->
+                <div class="cpu-bars" id="cpuBars"></div>
+                <div class="cpu-legend">
+                    <div class="cpu-legend-item"><div class="cpu-legend-color cpu-legend-user"></div> User</div>
+                    <div class="cpu-legend-item"><div class="cpu-legend-color cpu-legend-system"></div> System</div>
+                    <div class="cpu-legend-item"><div class="cpu-legend-color cpu-legend-iowait"></div> I/O Wait</div>
                 </div>
             </div>
             <div class="card">
@@ -749,138 +612,156 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div class="card">
                 <div class="card-title">Uptime</div>
                 <div class="card-value" id="uptime">-</div>
-                <div class="card-sub">node uptime</div>
+                <div class="card-sub">system uptime</div>
             </div>
         </div>
 
         <div class="footer">
             <p>Auto-refreshes every 5 seconds | <span id="lastUpdate">-</span></p>
-            <p style="margin-top: 10px;"><a href="https://github.com/Antisys/bitcoin-sync-dashboard" target="_blank">GitHub</a></p>
         </div>
     </div>
 
     <script>
-        function formatNumber(num) {
-            return num.toLocaleString();
-        }
+        function fmt(n) { return n.toLocaleString(); }
 
-        function formatCompact(num) {
-            if (num >= 1e12) return (num / 1e12).toFixed(2) + 'T';
-            if (num >= 1e9) return (num / 1e9).toFixed(2) + 'B';
-            if (num >= 1e6) return (num / 1e6).toFixed(2) + 'M';
-            if (num >= 1e3) return (num / 1e3).toFixed(1) + 'K';
-            return num.toLocaleString();
-        }
-
-        function renderCpuBars(perCore) {
-            if (!perCore || perCore.length === 0) return;
-
-            var container = document.getElementById('cpuBars');
-            var html = '';
-
-            for (var i = 0; i < perCore.length; i++) {
-                var core = perCore[i];
-                var user = core.user || 0;
-                var system = core.system || 0;
-                var iowait = core.iowait || 0;
-                var total = user + system + iowait;
-
-                html += '<div class="cpu-bar-container">';
-                html += '<span class="cpu-bar-label">Core ' + core.core + '</span>';
-                html += '<div class="cpu-bar-bg" style="display: flex;">';
-                html += '<div class="cpu-bar cpu-bar-user" style="width: ' + user.toFixed(1) + '%;"></div>';
-                html += '<div class="cpu-bar cpu-bar-system" style="width: ' + system.toFixed(1) + '%;"></div>';
-                if (iowait > 0.1) {
-                    html += '<div class="cpu-bar cpu-bar-iowait" style="width: ' + iowait.toFixed(1) + '%;"></div>';
-                }
-                html += '</div>';
-                html += '<span class="cpu-bar-value">' + total.toFixed(0) + '%</span>';
-                html += '</div>';
+        function renderCpuBars(cores) {
+            if (!cores) return;
+            let html = '';
+            for (let c of cores) {
+                let total = (c.user||0) + (c.system||0) + (c.iowait||0);
+                html += `<div class="cpu-bar-row">
+                    <span class="cpu-bar-label">Core ${c.core}</span>
+                    <div class="cpu-bar-bg">
+                        <div class="cpu-bar-user" style="width:${c.user||0}%"></div>
+                        <div class="cpu-bar-system" style="width:${c.system||0}%"></div>
+                        <div class="cpu-bar-iowait" style="width:${c.iowait||0}%"></div>
+                    </div>
+                    <span class="cpu-bar-val">${total.toFixed(0)}%</span>
+                </div>`;
             }
-
-            container.innerHTML = html;
+            document.getElementById('cpuBars').innerHTML = html;
         }
 
-        function updateDashboard() {
-            fetch('/api/stats')
-                .then(r => r.json())
-                .then(data => {
-                    if (data.error) {
-                        document.getElementById('status').textContent = 'Connection Error';
-                        document.getElementById('statusDot').className = 'status-dot status-error';
-                        return;
-                    }
-
-                    const progress = data.progress || 0;
-                    document.getElementById('progressBar').style.width = Math.min(progress, 100) + '%';
-                    document.getElementById('progressPct').textContent = progress.toFixed(4) + '%';
-
-                    if (data.ibd) {
-                        document.getElementById('status').textContent = 'Initial Block Download';
-                        document.getElementById('statusDot').className = 'status-dot status-syncing';
-                    } else {
-                        document.getElementById('status').textContent = 'Synced';
-                        document.getElementById('statusDot').className = 'status-dot status-synced';
-                    }
-
-                    document.getElementById('currentBlock').textContent = formatNumber(data.height || 0);
-                    document.getElementById('targetBlock').textContent = formatNumber(data.headers || 0);
-                    document.getElementById('blocksRemaining').textContent = formatNumber(data.blocks_remaining || 0);
-
-                    const speed = data.speed_short || 0;
-                    document.getElementById('syncSpeed').textContent = speed.toFixed(1);
-                    document.getElementById('eta').textContent = data.eta_human || 'Calculating...';
-
-                    document.getElementById('diskUsage').textContent = data.size_on_disk_human || '-';
-                    document.getElementById('pruneStatus').textContent = data.pruned ? 'pruned mode' : 'full node';
-
-                    document.getElementById('connections').textContent = data.connections || 0;
-                    document.getElementById('connectionDetails').textContent =
-                        (data.connections_in || 0) + ' in / ' + (data.connections_out || 0) + ' out';
-
-                    document.getElementById('network').textContent = (data.chain || 'main').toUpperCase();
-                    document.getElementById('version').textContent = data.version || '-';
-
-                    document.getElementById('difficulty').textContent = formatCompact(data.difficulty || 0);
-
-                    // CPU stats - real utilization
-                    if (data.cpu_total_used !== undefined) {
-                        document.getElementById('cpuTotal').textContent = data.cpu_total_used.toFixed(1) + '%';
-                        document.getElementById('cpuUser').textContent = (data.cpu_user || 0).toFixed(1) + '%';
-                        document.getElementById('cpuSystem').textContent = (data.cpu_system || 0).toFixed(1) + '%';
-                        document.getElementById('cpuIowait').textContent = (data.cpu_iowait || 0).toFixed(1) + '%';
-                        document.getElementById('cpuIdle').textContent = (data.cpu_idle || 0).toFixed(1) + '%';
-                    } else {
-                        document.getElementById('cpuTotal').textContent = 'Measuring...';
-                    }
-
-                    document.getElementById('cpuModel').textContent = (data.cpu_model || 'Unknown') + ' (' + (data.cpu_cores || '?') + ' cores)';
-
-                    // Per-core CPU bars
-                    if (data.cpu_per_core) {
-                        renderCpuBars(data.cpu_per_core);
-                    }
-
-                    // Memory
-                    if (data.mem_percent !== undefined) {
-                        document.getElementById('memUsage').textContent = data.mem_percent.toFixed(0) + '%';
-                        document.getElementById('memDetails').textContent = (data.mem_used_human || '-') + ' / ' + (data.mem_total_human || '-');
-                    }
-
-                    if (data.uptime_human) {
-                        document.getElementById('uptime').textContent = data.uptime_human;
-                    }
-
-                    document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-                })
-                .catch(err => {
-                    document.getElementById('status').textContent = 'Error';
+        function update() {
+            fetch('/api/stats').then(r => r.json()).then(d => {
+                if (d.error) {
+                    document.getElementById('statusText').textContent = 'Error';
                     document.getElementById('statusDot').className = 'status-dot status-error';
-                });
+                    return;
+                }
+
+                const isAssume = d.assumeutxo;
+                const headers = d.headers || 0;
+
+                // Mode indicator
+                document.getElementById('modeIndicator').textContent = isAssume ? 'AssumeUTXO' : 'Normal Sync';
+                document.getElementById('modeIndicator').className = 'mode-indicator ' + (isAssume ? 'mode-assumeutxo' : 'mode-normal');
+
+                // Show/hide assumeutxo elements
+                document.getElementById('snapshotLabel').style.display = isAssume ? 'inline' : 'none';
+                document.getElementById('snapshotMarker').style.display = isAssume ? 'block' : 'none';
+                document.getElementById('legend').style.display = isAssume ? 'flex' : 'none';
+
+                if (isAssume) {
+                    // AssumeUTXO mode - dual progress
+                    const snapshot = d.snapshot_height || 840000;
+                    const bottom = d.bottom_height || 0;
+                    const top = d.top_height || snapshot;
+
+                    const snapshotPct = (snapshot / headers) * 100;
+                    const bottomPct = (bottom / headers) * 100;
+                    const topPct = (top / headers) * 100;
+
+                    // Bottom bar (validation from 0)
+                    document.getElementById('barBottom').style.width = bottomPct + '%';
+
+                    // Top bar (from snapshot to current)
+                    document.getElementById('barTop').style.left = snapshotPct + '%';
+                    document.getElementById('barTop').style.width = (topPct - snapshotPct) + '%';
+
+                    // Snapshot marker
+                    document.getElementById('snapshotMarker').style.left = snapshotPct + '%';
+
+                    // Labels
+                    document.getElementById('labelBottom').textContent = fmt(bottom);
+                    document.getElementById('labelTop').textContent = fmt(top);
+                    document.getElementById('tipLabel').textContent = 'Tip: ' + fmt(headers);
+
+                    // Stats
+                    const bottomRemain = snapshot - bottom;
+                    const topRemain = headers - top;
+                    document.getElementById('bottomStats').innerHTML =
+                        `Block ${fmt(bottom)} / ${fmt(snapshot)}<br>` +
+                        `<span style="font-size:0.7em">${fmt(bottomRemain)} remaining` +
+                        (d.speed_bottom ? ` @ ${d.speed_bottom.toFixed(1)} b/s` : '') +
+                        (d.eta_bottom_human ? ` (ETA: ${d.eta_bottom_human})` : '') + `</span>`;
+
+                    document.getElementById('topStats').innerHTML =
+                        `Block ${fmt(top)} / ${fmt(headers)}<br>` +
+                        `<span style="font-size:0.7em">${fmt(topRemain)} remaining` +
+                        (d.speed_top ? ` @ ${d.speed_top.toFixed(1)} b/s` : '') +
+                        (d.eta_top_human ? ` (ETA: ${d.eta_top_human})` : '') + `</span>`;
+
+                    document.getElementById('progressStats').style.display = 'grid';
+
+                    // Status
+                    const synced = (top >= headers) && (bottom >= snapshot);
+                    document.getElementById('statusText').textContent = synced ? 'Synced' : 'Syncing...';
+                    document.getElementById('statusDot').className = 'status-dot ' + (synced ? 'status-synced' : 'status-syncing');
+
+                } else {
+                    // Normal sync mode
+                    const height = d.height || 0;
+                    const pct = headers > 0 ? (height / headers) * 100 : 0;
+
+                    document.getElementById('barBottom').style.width = '0%';
+                    document.getElementById('barTop').style.left = '0%';
+                    document.getElementById('barTop').style.width = pct + '%';
+
+                    document.getElementById('labelBottom').textContent = '';
+                    document.getElementById('labelTop').textContent = fmt(height) + ' (' + pct.toFixed(2) + '%)';
+                    document.getElementById('tipLabel').textContent = 'Tip: ' + fmt(headers);
+
+                    document.getElementById('progressStats').style.display = 'none';
+
+                    document.getElementById('statusText').textContent = d.ibd ? 'Syncing...' : 'Synced';
+                    document.getElementById('statusDot').className = 'status-dot ' + (d.ibd ? 'status-syncing' : 'status-synced');
+                }
+
+                // Common stats
+                document.getElementById('currentHeight').textContent = fmt(d.height || d.top_height || 0);
+                document.getElementById('heightSub').textContent = 'of ' + fmt(headers) + ' blocks';
+
+                document.getElementById('connections').textContent = d.connections || 0;
+                document.getElementById('connSub').textContent = (d.connections_in||0) + ' in / ' + (d.connections_out||0) + ' out';
+
+                document.getElementById('diskUsage').textContent = d.size_on_disk_human || '-';
+                document.getElementById('diskSub').textContent = d.pruned ? 'pruned' : 'full node';
+
+                document.getElementById('version').textContent = (d.version || '-').replace(/\\//g, '');
+
+                // System stats
+                if (d.cpu_total_used !== undefined) {
+                    document.getElementById('cpuUsage').textContent = d.cpu_total_used.toFixed(1) + '%';
+                }
+                document.getElementById('cpuModel').textContent = (d.cpu_model || '-') + ' (' + (d.cpu_cores || '?') + ' cores)';
+                renderCpuBars(d.cpu_per_core);
+
+                if (d.mem_percent !== undefined) {
+                    document.getElementById('memUsage').textContent = d.mem_percent.toFixed(0) + '%';
+                    document.getElementById('memDetails').textContent = (d.mem_used_human||'-') + ' / ' + (d.mem_total_human||'-');
+                }
+
+                document.getElementById('uptime').textContent = d.uptime_human || '-';
+                document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+
+            }).catch(e => {
+                document.getElementById('statusText').textContent = 'Connection Error';
+            });
         }
 
-        updateDashboard();
-        setInterval(updateDashboard, 5000);
+        update();
+        setInterval(update, 5000);
     </script>
 </body>
 </html>'''
@@ -888,7 +769,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # Suppress logging
+        pass
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -906,17 +787,16 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
             stats = get_bitcoin_stats()
-            if stats and 'height' in stats:
-                stats = calculate_speed_and_eta(stats)
+            if stats:
+                stats = calculate_speed(stats)
                 stats['size_on_disk_human'] = format_bytes(stats.get('size_on_disk', 0))
-                # Add system stats
                 sys_stats = get_system_stats()
                 stats.update(sys_stats)
                 if 'mem_total' in stats:
                     stats['mem_total_human'] = format_bytes(stats['mem_total'])
                     stats['mem_used_human'] = format_bytes(stats['mem_used'])
             else:
-                stats = {'error': 'Could not fetch Bitcoin stats'}
+                stats = {'error': 'Could not fetch stats'}
 
             self.wfile.write(json.dumps(stats).encode())
 
@@ -931,56 +811,29 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Bitcoin Sync Dashboard - Real-time monitoring for Bitcoin Core IBD',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  %(prog)s                                    # Local bitcoind
-  %(prog)s --host 192.168.1.100 --ssh-user pi # Remote node via SSH
-  %(prog)s --docker bitcoind                  # Local Docker container
-  %(prog)s --host 10.0.0.5 --docker bitcoin   # Remote Docker via SSH
-        '''
-    )
-    parser.add_argument('--host', default='localhost',
-                        help='Bitcoin node hostname/IP (default: localhost)')
-    parser.add_argument('--ssh-user', default=os.environ.get('USER', 'root'),
-                        help='SSH username for remote nodes')
-    parser.add_argument('--port', type=int, default=8888,
-                        help='Dashboard web port (default: 8888)')
-    parser.add_argument('--rpc-host', default='127.0.0.1',
-                        help='Bitcoin RPC host (default: 127.0.0.1)')
-    parser.add_argument('--rpc-port', type=int, default=8332,
-                        help='Bitcoin RPC port (default: 8332)')
-    parser.add_argument('--docker', metavar='CONTAINER',
-                        help='Docker container name if bitcoind runs in Docker')
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description='Bitcoin Sync Dashboard')
+    parser.add_argument('--host', default='localhost')
+    parser.add_argument('--ssh-user', default=os.environ.get('USER', 'root'))
+    parser.add_argument('--port', type=int, default=8890)
+    parser.add_argument('--docker', metavar='CONTAINER')
+    args = parser.parse_args()
 
     CONFIG['host'] = args.host
     CONFIG['ssh_user'] = args.ssh_user
     CONFIG['port'] = args.port
-    CONFIG['rpc_host'] = args.rpc_host
-    CONFIG['rpc_port'] = args.rpc_port
     CONFIG['docker_container'] = args.docker
 
     print(f"Bitcoin Sync Dashboard")
-    print(f"======================")
     print(f"Node: {CONFIG['host']}")
     if CONFIG['docker_container']:
         print(f"Docker: {CONFIG['docker_container']}")
     print(f"Dashboard: http://0.0.0.0:{CONFIG['port']}")
-    print()
 
-    class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
         allow_reuse_address = True
-        daemon_threads = True
 
-    with ThreadedTCPServer(("0.0.0.0", CONFIG['port']), DashboardHandler) as httpd:
+    with Server(("0.0.0.0", CONFIG['port']), DashboardHandler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
